@@ -90,6 +90,29 @@ class HDTicket(Document):
 
     def validate(self):
         self.validate_feedback()
+        self.validate_resolution_hours()
+
+    def validate_resolution_hours(self):
+        """Exige `resolution_hours` cuando el ticket pasa a Resolved/Closed.
+
+        La SPA del agente abre un modal pidiendo las horas antes de cambiar
+        el status; esta validacion server-side cubre cambios via API,
+        workflows o cualquier camino que se saltee el modal.
+        """
+        if self.status not in ("Resolved", "Closed"):
+            return
+        old = self.get_doc_before_save()
+        # Si ya venia en Resolved/Closed (p.ej. ediciones de otros campos),
+        # no es una transicion fresca, no exigir.
+        if old and old.status in ("Resolved", "Closed"):
+            return
+        if not self.get("resolution_hours"):
+            frappe.throw(
+                _(
+                    "Las horas trabajadas son obligatorias para resolver o "
+                    "cerrar el ticket."
+                )
+            )
 
     def before_save(self):
         self.apply_sla()

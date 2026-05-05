@@ -134,6 +134,8 @@ init_site() {
   configure_host_url              || echo ">> AVISO: configure_host_url falló — los links de emails podrían quedar con :8000."
   configure_administrator_email   || echo ">> AVISO: no pude actualizar email del Administrator; continúa el init."
   enable_scheduler_if_disabled    || echo ">> AVISO: no pude habilitar el scheduler; los emails encolados no van a salir automáticamente."
+  configure_resolution_hours      || echo ">> AVISO: no pude crear custom field resolution_hours; continúa el init."
+  configure_resolution_notification || echo ">> AVISO: no pude crear la Notification de resolución; continúa el init."
 
   bench use "${SITE}"
   bench --site "${SITE}" clear-cache
@@ -561,6 +563,131 @@ PY
 enable_scheduler_if_disabled() {
   echo ">> Asegurando que el scheduler esté habilitado..."
   bench --site "${SITE}" enable-scheduler
+}
+
+# -------------------------------------------------------------------------
+# Crea (idempotente) el Custom Field `resolution_hours` en HD Ticket.
+#
+# Lo usa el modal del SPA que pide horas trabajadas al pasar a Resolved/
+# Closed. La validacion server-side en hd_ticket.py:validate_resolution_hours
+# tambien lee este campo.
+# -------------------------------------------------------------------------
+configure_resolution_hours() {
+  echo ">> Creando/verificando Custom Field resolution_hours en HD Ticket..."
+  mkdir -p /home/frappe/logs
+  mkdir -p "/home/frappe/frappe-bench/sites/${SITE}/logs"
+
+  cat > /tmp/resolution_hours_field.py <<'PY'
+import os
+import logging.handlers
+
+_orig = logging.handlers.RotatingFileHandler.__init__
+def _safe(self, filename, *a, **kw):
+    try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+    except Exception:
+        pass
+    _orig(self, filename, *a, **kw)
+logging.handlers.RotatingFileHandler.__init__ = _safe
+
+import frappe
+frappe.init(site=os.environ["SITE"], sites_path="/home/frappe/frappe-bench/sites")
+frappe.connect()
+
+NAME = "HD Ticket-resolution_hours"
+if frappe.db.exists("Custom Field", NAME):
+    print(f"[resolution_hours] Custom Field ya existe: {NAME}")
+else:
+    cf = frappe.get_doc({
+        "doctype": "Custom Field",
+        "dt": "HD Ticket",
+        "fieldname": "resolution_hours",
+        "label": "Horas trabajadas",
+        "fieldtype": "Float",
+        "insert_after": "status",
+        "non_negative": 1,
+        "precision": 2,
+        "description": "Horas dedicadas a resolver el ticket. Obligatorio al pasar a Resolved/Closed.",
+    })
+    cf.insert(ignore_permissions=True)
+    frappe.db.commit()
+    print(f"[resolution_hours] Custom Field creado: {NAME}")
+PY
+
+  SITE="${SITE}" ./env/bin/python /tmp/resolution_hours_field.py
+}
+
+# -------------------------------------------------------------------------
+# Crea (idempotente) la Notification que dispara email al cliente cuando
+# un ticket pasa a Resolved/Closed.
+#
+# Notification doctype:
+#   - event=Value Change + value_changed=status
+#   - condition: doc.status in ("Resolved","Closed")
+#   - recipient: receiver_by_document_field=raised_by
+#   - channel: Email
+# Las horas trabajadas NO se incluyen en el cuerpo (decision del usuario).
+# -------------------------------------------------------------------------
+configure_resolution_notification() {
+  echo ">> Creando/verificando Notification de resolucion de ticket..."
+  cat > /tmp/resolution_notification.py <<'PY'
+import os
+import logging.handlers
+
+_orig = logging.handlers.RotatingFileHandler.__init__
+def _safe(self, filename, *a, **kw):
+    try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+    except Exception:
+        pass
+    _orig(self, filename, *a, **kw)
+logging.handlers.RotatingFileHandler.__init__ = _safe
+
+import frappe
+frappe.init(site=os.environ["SITE"], sites_path="/home/frappe/frappe-bench/sites")
+frappe.connect()
+
+NAME = "Ticket Resuelto/Cerrado - Aviso al Cliente"
+
+subject = "Tu ticket #{{ doc.name }} fue {{ doc.status | lower }}"
+message = (
+    "<p>Hola,</p>"
+    "<p>Tu ticket <strong>#{{ doc.name }} - {{ doc.subject }}</strong> "
+    "fue marcado como <strong>{{ doc.status }}</strong>.</p>"
+    "<p>Si necesitas reabrir el caso o agregar informacion, simplemente "
+    "responde este email.</p>"
+    "<p>Saludos,<br>Equipo de Soporte</p>"
+)
+
+if frappe.db.exists("Notification", NAME):
+    doc = frappe.get_doc("Notification", NAME)
+    print(f"[notif] Notification existe, actualizo: {NAME}")
+else:
+    doc = frappe.new_doc("Notification")
+    doc.name = NAME
+    print(f"[notif] Creando Notification: {NAME}")
+
+doc.subject = subject
+doc.document_type = "HD Ticket"
+doc.is_standard = 0
+doc.channel = "Email"
+doc.event = "Value Change"
+doc.value_changed = "status"
+doc.condition = 'doc.status in ("Resolved", "Closed")'
+doc.message = message
+doc.enabled = 1
+doc.send_to_all_assignees = 0
+
+# Reset y agregar recipients (campo `raised_by` del HD Ticket)
+doc.recipients = []
+doc.append("recipients", {"receiver_by_document_field": "raised_by"})
+
+doc.save(ignore_permissions=True)
+frappe.db.commit()
+print(f"[notif] Notification configurada: {doc.name} (enabled={doc.enabled})")
+PY
+
+  SITE="${SITE}" ./env/bin/python /tmp/resolution_notification.py
 }
 
 # -------------------------------------------------------------------------
