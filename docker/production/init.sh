@@ -234,22 +234,17 @@ configure_s3_attachment_doctype() {
   mkdir -p /home/frappe/logs
   mkdir -p "/home/frappe/frappe-bench/sites/${SITE}/logs"
 
-  S3_KEY="${S3_ACCESS_KEY_ID}" \
-  S3_SECRET="${S3_SECRET_ACCESS_KEY}" \
-  S3_BUCKET_VAR="${S3_BUCKET}" \
-  S3_REGION_VAR="${S3_REGION:-us-east-1}" \
-  S3_FOLDER_VAR="${S3_FOLDER_NAME:-helpdesk}" \
-  S3_ENDPOINT_VAR="${S3_ENDPOINT_URL:-}" \
-  S3_SIG_VAR="${S3_SIGNATURE_VERSION:-s3v4}" \
-  ./env/bin/python - <<PY
+  # Escribimos el script a un archivo (en vez de heredoc directo a `python -`)
+  # para evitar cualquier expansión de shell sobre el contenido. Los valores
+  # van por env vars; el heredoc 'PY' (con comillas) es 100% literal.
+  cat > /tmp/s3_attach_setup.py <<'PY'
 import os
 import logging.handlers
 
 # Monkey-patch RotatingFileHandler para crear el dir padre si falta.
-# Frappe arma rutas de log usando local.site (relativo a cwd), no
-# local.site_path. Cuando se invoca fuera de la CLI `bench` no siempre
-# coinciden — y como no hay forma estable de controlar eso vía argumento
-# entre versiones, lo más robusto es asegurar que el dir exista al abrirlo.
+# Frappe arma algunas rutas de log relativas y no siempre coinciden con
+# donde estamos parados. Asegurar la existencia del dir al abrir el archivo
+# es lo más robusto entre versiones de Frappe.
 _orig_init = logging.handlers.RotatingFileHandler.__init__
 def _safe_init(self, filename, *a, **kw):
     try:
@@ -260,22 +255,27 @@ def _safe_init(self, filename, *a, **kw):
 logging.handlers.RotatingFileHandler.__init__ = _safe_init
 
 import frappe
-frappe.init(site="${SITE}", sites_path="/home/frappe/frappe-bench/sites")
+
+frappe.init(
+    site=os.environ["S3_SITE"],
+    sites_path="/home/frappe/frappe-bench/sites",
+)
 frappe.connect()
 
-# Probamos los nombres de doctype más comunes que ha tenido la app a lo
+# Probamos los nombres de doctype mas comunes que ha tenido la app a lo
 # largo de su historia. Nos quedamos con el primero que exista.
 candidates = ["S3 File Attachment", "S3 File Settings", "S3 Settings"]
-target = next((c for c in candidates if frappe.db.exists("DocType", c)), None)
+target = next(
+    (c for c in candidates if frappe.db.exists("DocType", c)),
+    None,
+)
 if not target:
-    print("[s3-attach] ningún doctype singleton encontrado, salteo auto-config")
+    print("[s3-attach] ningun doctype singleton encontrado, salteo auto-config")
     raise SystemExit(0)
 
 doc = frappe.get_single(target)
 fields = {df.fieldname for df in doc.meta.fields}
 
-# mapping nombre-campo-doctype -> valor desde env. Probamos varios alias
-# por campo porque la app no es 100% consistente entre forks/versiones.
 def first_match(*names):
     return next((n for n in names if n in fields), None)
 
@@ -301,10 +301,19 @@ for fieldname, value in writes.items():
 
 doc.save(ignore_permissions=True)
 frappe.db.commit()
-print(f"[s3-attach] {target} configurado: " + ", ".join(
-    fn for fn in writes if fn
-))
+applied = [fn for fn in writes if fn]
+print("[s3-attach] " + target + " configurado: " + ", ".join(applied))
 PY
+
+  S3_SITE="${SITE}" \
+  S3_KEY="${S3_ACCESS_KEY_ID}" \
+  S3_SECRET="${S3_SECRET_ACCESS_KEY}" \
+  S3_BUCKET_VAR="${S3_BUCKET}" \
+  S3_REGION_VAR="${S3_REGION:-us-east-1}" \
+  S3_FOLDER_VAR="${S3_FOLDER_NAME:-helpdesk}" \
+  S3_ENDPOINT_VAR="${S3_ENDPOINT_URL:-}" \
+  S3_SIG_VAR="${S3_SIGNATURE_VERSION:-s3v4}" \
+  ./env/bin/python /tmp/s3_attach_setup.py
 }
 
 # -------------------------------------------------------------------------
