@@ -85,6 +85,22 @@ RUN ./env/bin/pip install \
 # enterarnos en build-time, no descubrirlo en runtime con un /helpdesk vacío.
 RUN bench build --production
 
+# Dereferencia los symlinks que bench build crea en sites/assets/.
+# bench symlinkea sites/assets/<app> -> ../../apps/<app>/<app>/public/ usando
+# rutas RELATIVAS. En el container backend esto resuelve bien (tiene apps/),
+# pero nginx solo monta el volumen `assets` y no tiene `apps/` — los
+# symlinks apuntan al vacío y todos los .css/.js dan 404. Reemplazamos
+# cada symlink top-level por una copia real de su target.
+RUN cd /home/frappe/frappe-bench/sites/assets && \
+    for link in $(find . -maxdepth 1 -type l); do \
+        target="$(readlink -f "$link")"; \
+        if [ -e "$target" ]; then \
+            echo "deref: $link -> $target"; \
+            rm "$link"; \
+            cp -rL "$target" "$link"; \
+        fi; \
+    done
+
 # Entrypoint del contenedor (también vive en el repo, lo copiamos a /home/frappe)
 COPY --chown=frappe:frappe docker/production/init.sh /home/frappe/init.sh
 RUN chmod +x /home/frappe/init.sh

@@ -124,8 +124,13 @@ init_site() {
     bench --site "${SITE}" migrate
   fi
 
-  configure_s3
-  configure_smtp
+  # configure_s3 y configure_smtp son nice-to-have. Si fallan (cred AWS,
+  # SES caído, doctype con campos distintos, etc.) NO queremos que mate el
+  # init completo y nos deje sin `bench use`, porque eso rompe el routing
+  # del sitio en nginx ("does not exist"). Los wrap-eamos en || true y
+  # dejamos un aviso para revisar el log.
+  configure_s3   || echo ">> AVISO: configure_s3 falló — revisar log; continúa el init."
+  configure_smtp || echo ">> AVISO: configure_smtp falló — revisar log; continúa el init."
 
   bench use "${SITE}"
   bench --site "${SITE}" clear-cache
@@ -348,8 +353,15 @@ case "${MODE}" in
     ;;
   start)
     configure_common_site_config
-    echo ">> Lanzando gunicorn..."
+    # Frappe en cada request hace `frappe.init(site, sites_path=".")` — busca
+    # el sitio relativo a cwd. `bench serve` corre gunicorn con cwd=sites/;
+    # acá replicamos eso con --chdir, que es la forma estándar y no rompe el
+    # resto del script. Sin esto, Frappe busca ./developticket.local/ desde
+    # el bench y devuelve 404 "does not exist" aunque el sitio exista en
+    # sites/developticket.local/.
+    echo ">> Lanzando gunicorn (chdir=sites/) ..."
     exec ./env/bin/gunicorn \
+      --chdir /home/frappe/frappe-bench/sites \
       --bind 0.0.0.0:8000 \
       --workers "${GUNICORN_WORKERS:-4}" \
       --threads "${GUNICORN_THREADS:-2}" \
