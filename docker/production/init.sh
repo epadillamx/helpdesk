@@ -129,9 +129,11 @@ init_site() {
   # init completo y nos deje sin `bench use`, porque eso rompe el routing
   # del sitio en nginx ("does not exist"). Los wrap-eamos en || true y
   # dejamos un aviso para revisar el log.
-  configure_s3       || echo ">> AVISO: configure_s3 falló — revisar log; continúa el init."
-  configure_smtp     || echo ">> AVISO: configure_smtp falló — revisar log; continúa el init."
-  configure_host_url || echo ">> AVISO: configure_host_url falló — los links de emails podrían quedar con :8000."
+  configure_s3                    || echo ">> AVISO: configure_s3 falló — revisar log; continúa el init."
+  configure_smtp                  || echo ">> AVISO: configure_smtp falló — revisar log; continúa el init."
+  configure_host_url              || echo ">> AVISO: configure_host_url falló — los links de emails podrían quedar con :8000."
+  configure_administrator_email   || echo ">> AVISO: no pude actualizar email del Administrator; continúa el init."
+  enable_scheduler_if_disabled    || echo ">> AVISO: no pude habilitar el scheduler; los emails encolados no van a salir automáticamente."
 
   bench use "${SITE}"
   bench --site "${SITE}" clear-cache
@@ -482,6 +484,83 @@ PY
   SMTP_SENDER="${sender}" \
   SMTP_USE_TLS="${USE_TLS:-1}" \
   ./env/bin/python /tmp/smtp_email_account.py
+}
+
+# -------------------------------------------------------------------------
+# Setea el email del usuario Administrator a AUTO_EMAIL_ID.
+#
+# Por qué: por default el Administrator tiene email "admin@example.com",
+# que NO es una identidad verificada en SES. Cuando Frappe arma un email
+# (notificaciones, invitaciones, etc.) toma el sender del usuario que lo
+# dispara. Si Administrator dispara, sale con admin@example.com → SES lo
+# rechaza/silencia y los emails no llegan.
+#
+# El Email Account con `always_use_account_email_id_as_sender=1` ya
+# fuerza el From al email del account, pero igualmente queremos que el
+# email del Admin esté seteado correcto por defensa en profundidad
+# (notificaciones internas, links de signup, etc. que podrían bypassearlo).
+# -------------------------------------------------------------------------
+configure_administrator_email() {
+  local sender="${AUTO_EMAIL_ID:-}"
+  if [ -z "${sender}" ]; then
+    return
+  fi
+
+  echo ">> Seteando email del Administrator a ${sender}..."
+  mkdir -p /home/frappe/logs
+  mkdir -p "/home/frappe/frappe-bench/sites/${SITE}/logs"
+
+  cat > /tmp/admin_email.py <<'PY'
+import os
+import logging.handlers
+
+_orig = logging.handlers.RotatingFileHandler.__init__
+def _safe(self, filename, *a, **kw):
+    try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+    except Exception:
+        pass
+    _orig(self, filename, *a, **kw)
+logging.handlers.RotatingFileHandler.__init__ = _safe
+
+import frappe
+frappe.init(
+    site=os.environ["SMTP_SITE"],
+    sites_path="/home/frappe/frappe-bench/sites",
+)
+frappe.connect()
+
+target = os.environ["SMTP_SENDER"]
+admin = frappe.get_doc("User", "Administrator")
+if admin.email == target:
+    print(f"[admin-email] Administrator.email ya es {target}, salteo.")
+else:
+    old = admin.email
+    admin.email = target
+    admin.save(ignore_permissions=True)
+    frappe.db.commit()
+    print(f"[admin-email] Administrator.email: {old} -> {target}")
+PY
+
+  SMTP_SITE="${SITE}" \
+  SMTP_SENDER="${sender}" \
+  ./env/bin/python /tmp/admin_email.py
+}
+
+# -------------------------------------------------------------------------
+# Habilita el scheduler de Frappe si está deshabilitado.
+#
+# Por qué: en Frappe v15, `bench new-site` deja el scheduler como
+# "UNSET" / "*** Scheduler is disabled ***" y sin scheduler corriendo:
+#   - La cola Email Queue se acumula pero nunca se flushea (status queda
+#     en "No enviado" indefinidamente).
+#   - Notificaciones programadas, backups, cleanup tasks tampoco corren.
+# `bench enable-scheduler` setea SystemSettings.enable_scheduler=1, que es
+# lo que el container `scheduler` chequea para procesar.
+# -------------------------------------------------------------------------
+enable_scheduler_if_disabled() {
+  echo ">> Asegurando que el scheduler esté habilitado..."
+  bench --site "${SITE}" enable-scheduler
 }
 
 # -------------------------------------------------------------------------
