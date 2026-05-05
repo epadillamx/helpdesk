@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info
 *.swp
 *.log
+*.env
 tags
 node_modules
 .vscode
