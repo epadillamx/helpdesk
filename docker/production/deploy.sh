@@ -10,6 +10,7 @@
 #   ./deploy.sh backup        # backup manual a S3
 #   ./deploy.sh shell         # consola dentro del backend
 #   ./deploy.sh upgrade       # rebuild + migrate + restart
+#   ./deploy.sh formulario    # crea el Web Form publico para tickets
 # =========================================================================
 set -euo pipefail
 
@@ -179,21 +180,132 @@ cmd_upgrade() {
   cmd_restart
 }
 
+# -------------------------------------------------------------------------
+# Crea (idempotente) un Web Form publico para que clientes externos abran
+# tickets sin loguearse. Lo monta en /nuevo-ticket. Si ya existe lo deja.
+# Permiso de Guest: solo `create` sobre HD Ticket — NO read/write — para
+# que un anonimo pueda crear pero no leer los tickets de otros.
+# -------------------------------------------------------------------------
+cmd_formulario() {
+  require_env
+  # shellcheck disable=SC1090
+  set -a; source "${ENV_FILE}"; set +a
+  local site="${SITE_NAME:?SITE_NAME no definida en .env}"
+
+  # En Git Bash (MINGW64) los paths POSIX se convierten a Windows antes de
+  # llegar al comando — `/home/...` se transforma a `C:/Program Files/Git/...`
+  # y docker exec falla. Desactivamos esa conversión para esta invocación.
+  if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
+    export MSYS_NO_PATHCONV=1
+  fi
+
+  echo ">> Creando/actualizando Web Form publico de tickets en ${site}..."
+
+  # Escribimos el script al backend via stdin del exec, despues lo corremos
+  # con el python del bench. Heredoc 'PY' (con comillas) es 100% literal,
+  # los valores van por env var SITE.
+  ${COMPOSE} exec -T backend bash -c "cat > /tmp/setup_form.py" <<'PY'
+import os
+import logging.handlers
+
+# Mismo monkey-patch que init.sh: aseguramos que existan los dirs de log
+# antes de que frappe los abra (sin esto frappe.connect() puede fallar
+# corriendo fuera del wrapper `bench`).
+_orig = logging.handlers.RotatingFileHandler.__init__
+def _safe(self, filename, *a, **kw):
+    try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+    except Exception:
+        pass
+    _orig(self, filename, *a, **kw)
+logging.handlers.RotatingFileHandler.__init__ = _safe
+
+import frappe
+
+frappe.init(
+    site=os.environ["SITE"],
+    sites_path="/home/frappe/frappe-bench/sites",
+)
+frappe.connect()
+
+ROUTE = "mut-ticket"
+TITLE = "MUT Ticket"
+
+# 1) Web Form publico (idempotente por route).
+existing = frappe.db.exists("Web Form", {"route": ROUTE})
+if existing:
+    print(f"[formulario] Web Form '{TITLE}' ya existe (name={existing}), salteo creacion.")
+else:
+    wf = frappe.get_doc({
+        "doctype": "Web Form",
+        "title": TITLE,
+        "route": ROUTE,
+        "doc_type": "HD Ticket",
+        "module": "Helpdesk",
+        "published": 1,
+        "login_required": 0,
+        "anonymous": 1,
+        "allow_multiple": 1,
+        "apply_document_permissions": 0,
+        "success_message": "Tu ticket ha sido creado. Te contactaremos pronto.",
+        "web_form_fields": [
+            {"fieldname": "subject",     "label": "Asunto",      "fieldtype": "Data",        "reqd": 1},
+            {"fieldname": "description", "label": "Descripcion", "fieldtype": "Text Editor", "reqd": 1},
+            {"fieldname": "raised_by",   "label": "Tu correo",   "fieldtype": "Data",        "reqd": 1, "options": "Email"},
+        ],
+    })
+    wf.insert(ignore_permissions=True)
+    print(f"[formulario] Web Form '{TITLE}' creado en /{ROUTE}")
+
+# 2) Permiso Guest sobre HD Ticket: SOLO create. Nada de read/write para
+#    no exponer los tickets de otros usuarios anonimos.
+existing_perm = frappe.db.exists(
+    "Custom DocPerm",
+    {"parent": "HD Ticket", "role": "Guest", "permlevel": 0},
+)
+if existing_perm:
+    print(f"[formulario] DocPerm Guest sobre HD Ticket ya existe (name={existing_perm}).")
+else:
+    perm = frappe.get_doc({
+        "doctype": "Custom DocPerm",
+        "parent": "HD Ticket",
+        "parenttype": "DocType",
+        "parentfield": "permissions",
+        "role": "Guest",
+        "permlevel": 0,
+        "create": 1,
+        "read": 0,
+        "write": 0,
+    })
+    perm.insert(ignore_permissions=True)
+    print(f"[formulario] DocPerm Guest:create sobre HD Ticket anadido.")
+
+frappe.db.commit()
+
+host_name = frappe.db.get_single_value("Website Settings", "subdomain") or frappe.local.site
+print(f"[formulario] Listo. Acceso publico en: /{ROUTE}  (sitio: {frappe.local.site})")
+PY
+
+  ${COMPOSE} exec -T -e SITE="${site}" backend /home/frappe/frappe-bench/env/bin/python /tmp/setup_form.py
+  echo ">> Listo. Probalo en: http://${site}/nuevo-ticket"
+}
+
 main() {
   local action="${1:-}"
   case "${action}" in
-    build)    cmd_build ;;
-    init)     cmd_init ;;
-    up)       cmd_up ;;
-    down)     cmd_down ;;
-    restart)  cmd_restart ;;
-    logs)     shift; cmd_logs "$@" ;;
-    backup)   cmd_backup ;;
-    shell)    cmd_shell ;;
-    upgrade)  cmd_upgrade ;;
-    check)    check_db_connection; check_s3_connection ;;
+    build)       cmd_build ;;
+    init)        cmd_init ;;
+    up)          cmd_up ;;
+    down)        cmd_down ;;
+    restart)     cmd_restart ;;
+    logs)        shift; cmd_logs "$@" ;;
+    backup)      cmd_backup ;;
+    shell)       cmd_shell ;;
+    upgrade)     cmd_upgrade ;;
+    formulario)  cmd_formulario ;;
+    check)       check_db_connection; check_s3_connection ;;
     *)
-      grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//' | head -n 12
+      grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//' | head -n 13
       exit 1
       ;;
   esac
