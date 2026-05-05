@@ -129,8 +129,9 @@ init_site() {
   # init completo y nos deje sin `bench use`, porque eso rompe el routing
   # del sitio en nginx ("does not exist"). Los wrap-eamos en || true y
   # dejamos un aviso para revisar el log.
-  configure_s3   || echo ">> AVISO: configure_s3 falló — revisar log; continúa el init."
-  configure_smtp || echo ">> AVISO: configure_smtp falló — revisar log; continúa el init."
+  configure_s3       || echo ">> AVISO: configure_s3 falló — revisar log; continúa el init."
+  configure_smtp     || echo ">> AVISO: configure_smtp falló — revisar log; continúa el init."
+  configure_host_url || echo ">> AVISO: configure_host_url falló — los links de emails podrían quedar con :8000."
 
   bench use "${SITE}"
   bench --site "${SITE}" clear-cache
@@ -319,6 +320,42 @@ PY
   S3_ENDPOINT_VAR="${S3_ENDPOINT_URL:-}" \
   S3_SIG_VAR="${S3_SIGNATURE_VERSION:-s3v4}" \
   ./env/bin/python /tmp/s3_attach_setup.py
+}
+
+# -------------------------------------------------------------------------
+# Configura `host_name` del sitio.
+#
+# Frappe usa `host_name` para construir URLs absolutas cuando NO hay
+# contexto de request (típicamente al renderizar emails desde workers).
+# Sin esto, cae al `webserver_port` del common_site_config (8000), y los
+# links de invitaciones / reset password salen con `:8000`.
+#
+# Tomamos PUBLIC_URL del .env (ej. `http://developticket.local` o
+# `https://helpdesk.midominio.com`). Si no está definido, derivamos
+# `http://${SITE}` como fallback razonable.
+#
+# IMPORTANTE: si PUBLIC_URL no trae puerto explícito, le agregamos el
+# default del scheme (:80 para http, :443 para https). Sin esto, Frappe
+# v15 le pega el webserver_port (8000) al host_name al armar URLs y los
+# emails de invitación salen con `http://host:8000/...`. Con un puerto
+# explícito Frappe no agrega el suyo, y los browsers omiten 80/443 al
+# mostrar la URL así que el link sigue viéndose limpio.
+# -------------------------------------------------------------------------
+configure_host_url() {
+  local url="${PUBLIC_URL:-http://${SITE}}"
+  url="${url%/}"  # quitar trailing slash
+
+  # ¿el URL ya tiene `:NNNN` después del host? Si no, lo inyectamos.
+  if ! echo "$url" | grep -qE '^https?://[^/]+:[0-9]+'; then
+    if [[ "$url" == https://* ]]; then
+      url=$(echo "$url" | sed -E 's|^(https://[^/]+)|\1:443|')
+    else
+      url=$(echo "$url" | sed -E 's|^(http://[^/]+)|\1:80|')
+    fi
+  fi
+
+  echo ">> Seteando host_name del sitio a ${url} ..."
+  bench --site "${SITE}" set-config host_name "${url}"
 }
 
 # -------------------------------------------------------------------------

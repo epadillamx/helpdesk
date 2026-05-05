@@ -212,3 +212,6 @@ USE_TLS=1
 - **`role "postgres" does not exist`**: en algunos DBaaS el superusuario no es `postgres`. Ajusta `DB_ROOT_USER`.
 - **Archivos suben pero no aparecen**: si esperas almacenamiento en S3 verifica que `frappe_s3_attachment` esté instalada **en el sitio** (`bench --site $SITE list-apps`).
 - **`502 Bad Gateway` en Nginx**: el backend aún no terminó `init`. Revisa `./deploy.sh logs site-creator`.
+
+
+user: Administrator
