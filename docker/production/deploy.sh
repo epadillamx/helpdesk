@@ -124,6 +124,26 @@ cmd_init() {
 
 cmd_up() {
   require_env
+  # Re-siembra automática del volumen `assets` en cada `up`.
+  #
+  # Por qué: cada vez que `./deploy.sh build` produce nuevos archivos en
+  # /home/frappe/frappe-bench/sites/assets dentro de la imagen, el volumen
+  # nombrado `production_assets` NO se re-siembra automáticamente porque
+  # docker solo copia el contenido de la imagen al volumen la primera vez
+  # que el volumen está vacío. Sin esto, el browser sigue pidiendo bundles
+  # con hashes nuevos pero el volumen mantiene los viejos -> 404 en CSS/JS.
+  #
+  # Cómo: bajamos los contenedores que tienen el volumen montado (todos
+  # menos los de soporte como mariadb/redis se levantan de cero igual),
+  # nukeamos solo `production_assets` (NO sites, ni mariadb-data, ni logs),
+  # y volvemos a subir. En la subida docker re-siembra desde la imagen.
+  echo ">> Bajando servicios para re-sembrar el volumen assets..."
+  ${COMPOSE} down --remove-orphans
+  if docker volume rm production_assets 2>/dev/null; then
+    echo ">> production_assets eliminado, se re-siembra desde la imagen."
+  else
+    echo ">> production_assets no existía o estaba vacío."
+  fi
   ${COMPOSE} up -d
   ${COMPOSE} ps
 }
