@@ -359,7 +359,15 @@ configure_host_url() {
 }
 
 # -------------------------------------------------------------------------
-# Configura SMTP saliente vía AWS SES
+# Configura SMTP saliente vía AWS SES.
+#
+# Hace DOS cosas:
+#   a) Escribe creds a `site_config.json` (legacy fallback que algunos
+#      paths de Frappe todavía usan).
+#   b) Crea / actualiza un registro `Email Account` con default_outgoing=1.
+#      Sin esto, Frappe v15 muestra "Unable to send email. Please setup
+#      default outgoing email account." en la UI cuando algo intenta
+#      mandar correo (ej: invitar a un usuario).
 # -------------------------------------------------------------------------
 configure_smtp() {
   # Soporta variables nuevas (SES_*) y legacy (MAIL_*) por compatibilidad.
@@ -367,18 +375,113 @@ configure_smtp() {
   local port="${SES_SMTP_PORT:-${MAIL_PORT:-587}}"
   local login="${SES_SMTP_USER:-${MAIL_LOGIN:-}}"
   local password="${SES_SMTP_PASSWORD:-${MAIL_PASSWORD:-}}"
+  local sender="${AUTO_EMAIL_ID:-}"
 
   if [ -z "${server}" ]; then
     echo ">> SMTP no configurado (SES_SMTP_ENDPOINT vacío), se omite."
     return
   fi
+  if [ -z "${sender}" ]; then
+    echo ">> AVISO: AUTO_EMAIL_ID vacío, no puedo armar Email Account; salteo SMTP."
+    return
+  fi
+
   echo ">> Configurando SMTP (server=${server}, user=${SES_IAM_USER_NAME:-${login}})..."
+
+  # (a) site_config.json — legacy
   bench --site "${SITE}" set-config mail_server "${server}"
   bench --site "${SITE}" set-config -p mail_port "${port}"
   bench --site "${SITE}" set-config mail_login "${login}"
   bench --site "${SITE}" set-config mail_password "${password}"
-  bench --site "${SITE}" set-config auto_email_id "${AUTO_EMAIL_ID}"
+  bench --site "${SITE}" set-config auto_email_id "${sender}"
   bench --site "${SITE}" set-config -p use_tls "${USE_TLS:-1}"
+
+  # (b) Email Account doctype — la fuente de verdad en v15
+  configure_smtp_email_account "${server}" "${port}" "${login}" "${password}" "${sender}"
+}
+
+configure_smtp_email_account() {
+  local server="$1" port="$2" login="$3" password="$4" sender="$5"
+
+  echo ">> Creando/actualizando Email Account (default_outgoing=1)..."
+  mkdir -p /home/frappe/logs
+  mkdir -p "/home/frappe/frappe-bench/sites/${SITE}/logs"
+
+  cat > /tmp/smtp_email_account.py <<'PY'
+import os
+import logging.handlers
+
+# Monkey-patch para que frappe.connect() no truene si faltan dirs de log.
+_orig = logging.handlers.RotatingFileHandler.__init__
+def _safe(self, filename, *a, **kw):
+    try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+    except Exception:
+        pass
+    _orig(self, filename, *a, **kw)
+logging.handlers.RotatingFileHandler.__init__ = _safe
+
+import frappe
+
+frappe.init(
+    site=os.environ["SMTP_SITE"],
+    sites_path="/home/frappe/frappe-bench/sites",
+)
+frappe.connect()
+
+server   = os.environ["SMTP_SERVER"]
+port     = int(os.environ.get("SMTP_PORT", "587"))
+login    = os.environ["SMTP_LOGIN"]
+password = os.environ["SMTP_PASSWORD"]
+sender   = os.environ["SMTP_SENDER"]
+use_tls  = bool(int(os.environ.get("SMTP_USE_TLS", "1")))
+
+ACCOUNT_NAME = "AWS SES"
+
+# Si ya hay uno marcado default_outgoing, lo reutilizamos. Si no, buscamos
+# por nombre. Si tampoco existe, lo creamos.
+existing = frappe.db.get_value("Email Account", {"default_outgoing": 1}, "name")
+if existing:
+    doc = frappe.get_doc("Email Account", existing)
+    print(f"[smtp] Email Account default_outgoing existente: {existing}, actualizo creds.")
+elif frappe.db.exists("Email Account", ACCOUNT_NAME):
+    doc = frappe.get_doc("Email Account", ACCOUNT_NAME)
+    print(f"[smtp] Email Account '{ACCOUNT_NAME}' existe, lo marco como default.")
+else:
+    doc = frappe.new_doc("Email Account")
+    doc.email_account_name = ACCOUNT_NAME
+    print(f"[smtp] Creando nuevo Email Account '{ACCOUNT_NAME}'.")
+
+doc.email_id = sender
+doc.smtp_server = server
+doc.smtp_port = port
+doc.login_id_is_different = 1 if login != sender else 0
+doc.login_id = login
+doc.password = password  # campo Password — Frappe lo encripta solo
+doc.use_tls = 1 if use_tls else 0
+doc.enable_outgoing = 1
+doc.default_outgoing = 1
+doc.always_use_account_email_id_as_sender = 1
+
+# Frappe valida la conexion SMTP al guardar. Si SES o el firewall fallan
+# en el momento del init, no queremos matar todo el setup; saltamos la
+# validacion de envio. La cuenta queda guardada y se valida al primer uso.
+doc.flags.no_smtp_validation = True
+doc.flags.ignore_validate = True
+
+doc.save(ignore_permissions=True)
+frappe.db.commit()
+print(f"[smtp] Email Account '{doc.name}' configurado (default_outgoing=1).")
+PY
+
+  SMTP_SITE="${SITE}" \
+  SMTP_SERVER="${server}" \
+  SMTP_PORT="${port}" \
+  SMTP_LOGIN="${login}" \
+  SMTP_PASSWORD="${password}" \
+  SMTP_SENDER="${sender}" \
+  SMTP_USE_TLS="${USE_TLS:-1}" \
+  ./env/bin/python /tmp/smtp_email_account.py
 }
 
 # -------------------------------------------------------------------------
