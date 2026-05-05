@@ -1,0 +1,148 @@
+# =========================================================================
+# Frappe Helpdesk - Despliegue de Producción
+#  - MariaDB:    contenedor local (motor por defecto y soportado por Frappe v15)
+#  - Storage:    S3 (AWS u otro compatible)
+#  - Redis:      contenedores locales (cache, queue, socketio)
+#
+# Nota: el deploy soporta también PostgreSQL externo. Para usarlo:
+#   - Definí en .env: DB_TYPE=postgres + DB_HOST/PORT/USER/PASSWORD del server
+#     externo (RDS, etc.).
+#   - Eliminá del `depends_on` de x-frappe-base la entrada `mariadb` o ignorala
+#     (no afecta si no levantás el servicio).
+#   - Tené en cuenta que Frappe v15 dejó de mantener fixes para Postgres; el
+#     camino estable y soportado es MariaDB con esta misma rama.
+# =========================================================================
+
+x-frappe-base: &frappe-base
+  image: helpdesk-prod:latest
+  # El contexto de build es la RAÍZ del repo (../..), para que el Dockerfile
+  # pueda copiar el código local de Helpdesk dentro de la imagen. La rama del
+  # app helpdesk ya no se controla con HELPDESK_BRANCH: lo que se construya
+  # depende del checkout actual del repo.
+  build:
+    context: ../..
+    dockerfile: docker/production/Dockerfile
+    args:
+      FRAPPE_BRANCH: ${FRAPPE_BRANCH:-version-15}
+  restart: unless-stopped
+  env_file:
+    - .env
+  environment:
+    AWS_PROFILE: ${AWS_PROFILE:-default}
+    AWS_REGION: ${AWS_REGION:-us-east-1}
+    AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+    AWS_SHARED_CREDENTIALS_FILE: /home/frappe/.aws/credentials
+    AWS_CONFIG_FILE: /home/frappe/.aws/config
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - assets:/home/frappe/frappe-bench/sites/assets
+    - logs:/home/frappe/frappe-bench/logs
+    # Perfil AWS del host (solo lectura) — se usa para S3/backups/etc.
+    - ${HOME:-${USERPROFILE}}/.aws:/home/frappe/.aws:ro
+  depends_on:
+    - redis-cache
+    - redis-queue
+    - mariadb
+
+services:
+  # ----- MariaDB (motor de base de datos) -----
+  # Versión 10.8: la combinación oficialmente soportada con Frappe v15. Las
+  # opciones de --skip-* son las recomendadas por Frappe (utf8mb4 + sin
+  # innodb-read-only-compressed por bug en 10.6/10.8).
+  mariadb:
+    image: mariadb:10.8
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD no definida}
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD
+        - mariadb-admin
+        - ping
+        - -h
+        - 127.0.0.1
+        - -uroot
+        - -p${DB_ROOT_PASSWORD}
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # ----- Redis (cache + queue + socketio en una sola instancia) -----
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-cache-data:/data
+
+  redis-queue:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-queue-data:/data
+
+  # ----- Inicialización del sitio (se ejecuta una sola vez) -----
+  site-creator:
+    <<: *frappe-base
+    command: ["init"]
+    restart: "no"
+
+  # ----- Servidor web Frappe (gunicorn) -----
+  backend:
+    <<: *frappe-base
+    command: ["start"]
+    depends_on:
+      - redis-cache
+      - redis-queue
+      - site-creator
+
+  # ----- Workers de cola de tareas -----
+  worker-default:
+    <<: *frappe-base
+    command: ["worker", "default"]
+
+  worker-short:
+    <<: *frappe-base
+    command: ["worker", "short"]
+
+  worker-long:
+    <<: *frappe-base
+    command: ["worker", "long"]
+
+  # ----- Scheduler (cron de Frappe) -----
+  scheduler:
+    <<: *frappe-base
+    command: ["schedule"]
+
+  # ----- Socket.IO para tiempo real -----
+  socketio:
+    <<: *frappe-base
+    command: ["socketio"]
+
+  # ----- Nginx como reverse proxy + static assets -----
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - socketio
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - sites:/var/www/sites:ro
+      - assets:/var/www/assets:ro
+
+volumes:
+  sites:
+  assets:
+  logs:
+  mariadb-data:
+  redis-cache-data:
+  redis-queue-data:

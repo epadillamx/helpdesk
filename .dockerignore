@@ -1,0 +1,56 @@
+# =========================================================================
+# Excluye del contexto de build de Docker todo lo que no se necesita dentro
+# de la imagen. Se usa cuando docker/production/docker-compose.yml lanza el
+# build con context=../.. (la raíz del repo).
+# =========================================================================
+
+# --- Control de versiones ---
+.git/
+.gitignore
+.gitmodules
+.git-blame-ignore-revs
+.github/
+.mergify.yml
+.pre-commit-config.yaml
+
+# --- Python / venv ---
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.tox/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# --- Node / frontend ---
+**/node_modules/
+**/.cache/
+**/.parcel-cache/
+**/.next/
+**/.nuxt/
+**/.svelte-kit/
+yarn-error.log
+
+# --- Builds que se regeneran con `bench build --production` ---
+**/dist/
+**/build/
+
+# --- IDE / SO ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.log
+
+# --- Secretos / locales (nunca dentro de la imagen) ---
+docker/production/.env
+docker/production/.env.local
+**/.env.local
+**/.env.*.local
+
+# --- Documentación grande / assets innecesarios para el runtime ---
+screenshot.webp
