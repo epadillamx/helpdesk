@@ -77,6 +77,45 @@
     @update="ticket.reload()"
   />
   <TicketSubjectModal v-model="showSubjectDialog" />
+
+  <!-- Modal: pide horas trabajadas al pasar a Resolved/Closed -->
+  <Dialog
+    v-model="showResolutionDialog"
+    :options="{
+      title: __('Horas trabajadas'),
+      actions: [
+        {
+          label: __('Cancelar'),
+          onClick: cancelResolution,
+        },
+        {
+          label: __('Confirmar'),
+          variant: 'solid',
+          onClick: confirmResolution,
+        },
+      ],
+    }"
+  >
+    <template #body-content>
+      <p class="mb-3 text-sm text-gray-700">
+        {{
+          __(
+            'Para marcar este ticket como "{0}" ingresá las horas trabajadas (decimal, ej: 1.5).'
+          ).replace('{0}', pendingStatus || "")
+        }}
+      </p>
+      <FormControl
+        v-model.number="resolutionHours"
+        type="number"
+        :placeholder="'1.5'"
+        :label="__('Horas trabajadas')"
+        :step="0.25"
+        :min="0"
+        autofocus
+        @keyup.enter="confirmResolution"
+      />
+    </template>
+  </Dialog>
 </template>
 
 <script setup lang="ts">
@@ -104,7 +143,9 @@ import {
   Button,
   call,
   createResource,
+  Dialog,
   Dropdown,
+  FormControl,
   toast,
 } from "frappe-ui";
 import {
@@ -145,24 +186,74 @@ const activities = inject(ActivitiesSymbol)!;
 const showSubjectDialog = ref(false);
 
 const { notifyTicketUpdate } = useNotifyTicketUpdate(ticket.value?.name);
+
+// Status que requieren capturar horas trabajadas antes de aplicar.
+// Si agregás otro status que tambien deba pedirlo, sumalo aca y al
+// validador server-side en hd_ticket.py:validate_resolution_hours().
+const STATUSES_REQUIRING_HOURS = ["Resolved", "Closed"];
+const showResolutionDialog = ref(false);
+const resolutionHours = ref<number | null>(null);
+const pendingStatus = ref<string | null>(null);
+
+function applyStatus(newStatus: string, extra: Record<string, any> = {}) {
+  notifyTicketUpdate("Status", newStatus);
+  // Si el status no cambia y no hay extras, no hace falta llamar al server.
+  if (
+    ticket.value.doc.status === newStatus &&
+    Object.keys(extra).length === 0
+  ) {
+    return;
+  }
+  ticket.value.setValue.submit(
+    { status: newStatus, ...extra },
+    {
+      onSuccess() {
+        activities.value.reload();
+      },
+    }
+  );
+}
+
+function handleStatusChange(newStatus: string) {
+  if (STATUSES_REQUIRING_HOURS.includes(newStatus)) {
+    pendingStatus.value = newStatus;
+    // Pre-cargar valor previo si existe (por si re-resuelven el ticket).
+    resolutionHours.value =
+      (ticket.value.doc as any).resolution_hours || null;
+    showResolutionDialog.value = true;
+  } else {
+    applyStatus(newStatus);
+  }
+}
+
+function confirmResolution() {
+  if (!resolutionHours.value || resolutionHours.value <= 0) {
+    toast.error(
+      __("Las horas trabajadas son obligatorias y deben ser mayores a 0.")
+    );
+    return;
+  }
+  applyStatus(pendingStatus.value!, {
+    resolution_hours: resolutionHours.value,
+  });
+  showResolutionDialog.value = false;
+  pendingStatus.value = null;
+  resolutionHours.value = null;
+}
+
+function cancelResolution() {
+  showResolutionDialog.value = false;
+  pendingStatus.value = null;
+  resolutionHours.value = null;
+}
+
 const statusDropdown = computed(() => {
   const statuses =
     ticketStatusStore.statuses.data?.filter((s) => s.enabled) || [];
   return statuses.map((o: HDTicketStatus) => ({
     label: o.label_agent,
     value: o.label_agent,
-    onClick: () => {
-      notifyTicketUpdate("Status", o.label_agent);
-      if (ticket.value.doc.status === o.label_agent) return;
-      ticket.value.setValue.submit(
-        { status: o.label_agent },
-        {
-          onSuccess() {
-            activities.value.reload();
-          },
-        }
-      );
-    },
+    onClick: () => handleStatusChange(o.label_agent),
     icon: () =>
       h(IndicatorIcon, {
         class: o.parsed_color,

@@ -129,9 +129,13 @@ init_site() {
   # init completo y nos deje sin `bench use`, porque eso rompe el routing
   # del sitio en nginx ("does not exist"). Los wrap-eamos en || true y
   # dejamos un aviso para revisar el log.
-  configure_s3       || echo ">> AVISO: configure_s3 falló — revisar log; continúa el init."
-  configure_smtp     || echo ">> AVISO: configure_smtp falló — revisar log; continúa el init."
-  configure_host_url || echo ">> AVISO: configure_host_url falló — los links de emails podrían quedar con :8000."
+  configure_s3                    || echo ">> AVISO: configure_s3 falló — revisar log; continúa el init."
+  configure_smtp                  || echo ">> AVISO: configure_smtp falló — revisar log; continúa el init."
+  configure_host_url              || echo ">> AVISO: configure_host_url falló — los links de emails podrían quedar con :8000."
+  configure_administrator_email   || echo ">> AVISO: no pude actualizar email del Administrator; continúa el init."
+  enable_scheduler_if_disabled    || echo ">> AVISO: no pude habilitar el scheduler; los emails encolados no van a salir automáticamente."
+  configure_resolution_hours      || echo ">> AVISO: no pude crear custom field resolution_hours; continúa el init."
+  configure_resolution_notification || echo ">> AVISO: no pude crear la Notification de resolución; continúa el init."
 
   bench use "${SITE}"
   bench --site "${SITE}" clear-cache
@@ -482,6 +486,208 @@ PY
   SMTP_SENDER="${sender}" \
   SMTP_USE_TLS="${USE_TLS:-1}" \
   ./env/bin/python /tmp/smtp_email_account.py
+}
+
+# -------------------------------------------------------------------------
+# Setea el email del usuario Administrator a AUTO_EMAIL_ID.
+#
+# Por qué: por default el Administrator tiene email "admin@example.com",
+# que NO es una identidad verificada en SES. Cuando Frappe arma un email
+# (notificaciones, invitaciones, etc.) toma el sender del usuario que lo
+# dispara. Si Administrator dispara, sale con admin@example.com → SES lo
+# rechaza/silencia y los emails no llegan.
+#
+# El Email Account con `always_use_account_email_id_as_sender=1` ya
+# fuerza el From al email del account, pero igualmente queremos que el
+# email del Admin esté seteado correcto por defensa en profundidad
+# (notificaciones internas, links de signup, etc. que podrían bypassearlo).
+# -------------------------------------------------------------------------
+configure_administrator_email() {
+  local sender="${AUTO_EMAIL_ID:-}"
+  if [ -z "${sender}" ]; then
+    return
+  fi
+
+  echo ">> Seteando email del Administrator a ${sender}..."
+  mkdir -p /home/frappe/logs
+  mkdir -p "/home/frappe/frappe-bench/sites/${SITE}/logs"
+
+  cat > /tmp/admin_email.py <<'PY'
+import os
+import logging.handlers
+
+_orig = logging.handlers.RotatingFileHandler.__init__
+def _safe(self, filename, *a, **kw):
+    try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+    except Exception:
+        pass
+    _orig(self, filename, *a, **kw)
+logging.handlers.RotatingFileHandler.__init__ = _safe
+
+import frappe
+frappe.init(
+    site=os.environ["SMTP_SITE"],
+    sites_path="/home/frappe/frappe-bench/sites",
+)
+frappe.connect()
+
+target = os.environ["SMTP_SENDER"]
+admin = frappe.get_doc("User", "Administrator")
+if admin.email == target:
+    print(f"[admin-email] Administrator.email ya es {target}, salteo.")
+else:
+    old = admin.email
+    admin.email = target
+    admin.save(ignore_permissions=True)
+    frappe.db.commit()
+    print(f"[admin-email] Administrator.email: {old} -> {target}")
+PY
+
+  SMTP_SITE="${SITE}" \
+  SMTP_SENDER="${sender}" \
+  ./env/bin/python /tmp/admin_email.py
+}
+
+# -------------------------------------------------------------------------
+# Habilita el scheduler de Frappe si está deshabilitado.
+#
+# Por qué: en Frappe v15, `bench new-site` deja el scheduler como
+# "UNSET" / "*** Scheduler is disabled ***" y sin scheduler corriendo:
+#   - La cola Email Queue se acumula pero nunca se flushea (status queda
+#     en "No enviado" indefinidamente).
+#   - Notificaciones programadas, backups, cleanup tasks tampoco corren.
+# `bench enable-scheduler` setea SystemSettings.enable_scheduler=1, que es
+# lo que el container `scheduler` chequea para procesar.
+# -------------------------------------------------------------------------
+enable_scheduler_if_disabled() {
+  echo ">> Asegurando que el scheduler esté habilitado..."
+  bench --site "${SITE}" enable-scheduler
+}
+
+# -------------------------------------------------------------------------
+# Crea (idempotente) el Custom Field `resolution_hours` en HD Ticket.
+#
+# Lo usa el modal del SPA que pide horas trabajadas al pasar a Resolved/
+# Closed. La validacion server-side en hd_ticket.py:validate_resolution_hours
+# tambien lee este campo.
+# -------------------------------------------------------------------------
+configure_resolution_hours() {
+  echo ">> Creando/verificando Custom Field resolution_hours en HD Ticket..."
+  mkdir -p /home/frappe/logs
+  mkdir -p "/home/frappe/frappe-bench/sites/${SITE}/logs"
+
+  cat > /tmp/resolution_hours_field.py <<'PY'
+import os
+import logging.handlers
+
+_orig = logging.handlers.RotatingFileHandler.__init__
+def _safe(self, filename, *a, **kw):
+    try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+    except Exception:
+        pass
+    _orig(self, filename, *a, **kw)
+logging.handlers.RotatingFileHandler.__init__ = _safe
+
+import frappe
+frappe.init(site=os.environ["SITE"], sites_path="/home/frappe/frappe-bench/sites")
+frappe.connect()
+
+NAME = "HD Ticket-resolution_hours"
+if frappe.db.exists("Custom Field", NAME):
+    print(f"[resolution_hours] Custom Field ya existe: {NAME}")
+else:
+    cf = frappe.get_doc({
+        "doctype": "Custom Field",
+        "dt": "HD Ticket",
+        "fieldname": "resolution_hours",
+        "label": "Horas trabajadas",
+        "fieldtype": "Float",
+        "insert_after": "status",
+        "non_negative": 1,
+        "precision": 2,
+        "description": "Horas dedicadas a resolver el ticket. Obligatorio al pasar a Resolved/Closed.",
+    })
+    cf.insert(ignore_permissions=True)
+    frappe.db.commit()
+    print(f"[resolution_hours] Custom Field creado: {NAME}")
+PY
+
+  SITE="${SITE}" ./env/bin/python /tmp/resolution_hours_field.py
+}
+
+# -------------------------------------------------------------------------
+# Crea (idempotente) la Notification que dispara email al cliente cuando
+# un ticket pasa a Resolved/Closed.
+#
+# Notification doctype:
+#   - event=Value Change + value_changed=status
+#   - condition: doc.status in ("Resolved","Closed")
+#   - recipient: receiver_by_document_field=raised_by
+#   - channel: Email
+# Las horas trabajadas NO se incluyen en el cuerpo (decision del usuario).
+# -------------------------------------------------------------------------
+configure_resolution_notification() {
+  echo ">> Creando/verificando Notification de resolucion de ticket..."
+  cat > /tmp/resolution_notification.py <<'PY'
+import os
+import logging.handlers
+
+_orig = logging.handlers.RotatingFileHandler.__init__
+def _safe(self, filename, *a, **kw):
+    try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+    except Exception:
+        pass
+    _orig(self, filename, *a, **kw)
+logging.handlers.RotatingFileHandler.__init__ = _safe
+
+import frappe
+frappe.init(site=os.environ["SITE"], sites_path="/home/frappe/frappe-bench/sites")
+frappe.connect()
+
+NAME = "Ticket Resuelto/Cerrado - Aviso al Cliente"
+
+subject = "Tu ticket #{{ doc.name }} fue {{ doc.status | lower }}"
+message = (
+    "<p>Hola,</p>"
+    "<p>Tu ticket <strong>#{{ doc.name }} - {{ doc.subject }}</strong> "
+    "fue marcado como <strong>{{ doc.status }}</strong>.</p>"
+    "<p>Si necesitas reabrir el caso o agregar informacion, simplemente "
+    "responde este email.</p>"
+    "<p>Saludos,<br>Equipo de Soporte</p>"
+)
+
+if frappe.db.exists("Notification", NAME):
+    doc = frappe.get_doc("Notification", NAME)
+    print(f"[notif] Notification existe, actualizo: {NAME}")
+else:
+    doc = frappe.new_doc("Notification")
+    doc.name = NAME
+    print(f"[notif] Creando Notification: {NAME}")
+
+doc.subject = subject
+doc.document_type = "HD Ticket"
+doc.is_standard = 0
+doc.channel = "Email"
+doc.event = "Value Change"
+doc.value_changed = "status"
+doc.condition = 'doc.status in ("Resolved", "Closed")'
+doc.message = message
+doc.enabled = 1
+doc.send_to_all_assignees = 0
+
+# Reset y agregar recipients (campo `raised_by` del HD Ticket)
+doc.recipients = []
+doc.append("recipients", {"receiver_by_document_field": "raised_by"})
+
+doc.save(ignore_permissions=True)
+frappe.db.commit()
+print(f"[notif] Notification configurada: {doc.name} (enabled={doc.enabled})")
+PY
+
+  SITE="${SITE}" ./env/bin/python /tmp/resolution_notification.py
 }
 
 # -------------------------------------------------------------------------
